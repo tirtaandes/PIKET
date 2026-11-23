@@ -1,0 +1,812 @@
+rules_version = '2';
+
+// =============================================================================
+// SMART ATTENDANCE – SMKN 6 MUARO JAMBI
+// Cloud Firestore Security Rules (Prototype – Review & Test Before Production)
+// =============================================================================
+//
+// Assumed Data Model & Authority Model
+// =============================================================================
+//
+// Authentication & Authorization (Firebase Auth Custom Claims ONLY):
+//   Set strictly by backend Cloud Functions via Firebase Admin SDK.
+//   Client-supplied role fields in Firestore documents or request payloads are
+//   NEVER trusted for authorization.
+//   - request.auth.token.role: 'ADMIN' | 'GURU_PIKET' | 'WALI_KELAS'
+//   - request.auth.token.active: bool (MUST be true; denied if false or absent)
+//   - request.auth.token.teacherId: string (optional)
+//   - request.auth.token.assignedClassId: string (required for WALI_KELAS)
+//
+// Collections:
+//
+// 1. system_settings/{docId}
+//    - docId == 'school_profile': Public read (non-sensitive school branding
+//      only: schoolName/name, npsn, logoUrl, address, city, province,
+//      academicYear, principal/principalName, contact/phone/email/website).
+//      NO student PII is permitted here.
+//    - docId == 'attendance': Active authenticated read. Contains morning/
+//      afternoon session windows, lateToleranceMinutes, maxClockSkewSeconds,
+//      offlineAuthDurationMinutes, exemptedClassIds, exemptedStudentIds.
+//    - Write (create/update/delete): ADMIN only, validated.
+//
+// 2. users/{uid}
+//    - Fields: uid, email, displayName, role, teacherId, assignedClassId,
+//      assignedClassName, phone, active, createdAt, updatedAt, createdBy, updatedBy.
+//    - Read: ADMIN (all) or self (active user where request.auth.uid == uid).
+//    - Write: DENIED from client (managed strictly via Cloud Functions).
+//
+// 3. students/{studentId}
+//    - Fields: nis (req), fullName (req), classId (req), active (req), id,
+//      nisn, gender ('L'|'P'), birthPlaceDate, address, phone, parentName,
+//      parentPhone, className, majorId, majorName, academicYearId,
+//      academicYearName, photoUrl, activeQrToken, classHistory (list), notes,
+//      qrUpdatedAt, createdAt (immutable), updatedAt, createdBy, updatedBy.
+//    - Read: ADMIN (all), GURU_PIKET (all), WALI_KELAS (own assignedClassId).
+//      Public/unauthenticated: DENIED.
+//    - Create/Update/Delete: ADMIN only, validated.
+//
+// 4. teachers/{teacherId}
+//    - Fields: fullName or name (req), id, uid (immutable once set), nip,
+//      nuptk, gender, email, phone, subject, position, role (display metadata
+//      only, never trusted for auth), assignedClassId, assignedClassName,
+//      photoUrl, active, notes, createdAt (immutable), updatedAt, createdBy, updatedBy.
+//    - Read: Any active authenticated user.
+//    - Create/Update/Delete: ADMIN only, validated.
+//
+// 5. classes/{classId}, majors/{majorId}, academic_years/{yearId}, holidays/{holidayId}
+//    - Master academic & calendar data.
+//    - Read: Any active authenticated user.
+//    - Create/Update/Delete: ADMIN only, validated.
+//
+// 6. duty_schedules/{scheduleId}
+//    - Fields: title (req), type ('HARIAN'|'MINGGUAN'|'TANGGAL', req),
+//      date (YYYY-MM-DD), daysOfWeek (list), teacherIds (list, req),
+//      teacherNames (map), startTime (HH:mm, req), endTime (HH:mm, req),
+//      active (bool, req), id, notes, createdAt (immutable), updatedAt,
+//      createdBy, updatedBy.
+//    - Read: ADMIN (all), GURU_PIKET (assigned schedules only via uid or
+//      teacherId claim), WALI_KELAS (DENIED).
+//    - Create/Update/Delete: ADMIN only, validated.
+//
+// 7. attendance/{attendanceId}  (Document ID: YYYY-MM-DD_{studentId})
+//    - Fields: id, date, studentId, nis, studentName, classId, className,
+//      majorId, majorName, academicYearId, academicYearName, morningStatus,
+//      morningTime, morningTimeWib, morningLateMinutes, morningTeacherUid,
+//      morningTeacherName, morningScheduleId, morningDeviceId,
+//      morningTransactionUuid, afternoonStatus, afternoonTime, afternoonTimeWib,
+//      afternoonTeacherUid, afternoonTeacherName, afternoonScheduleId,
+//      afternoonDeviceId, afternoonTransactionUuid, missingMorningWarning,
+//      syncStatus, sourceMode, flaggedForReview, clockSkewSeconds,
+//      deviceLocalTimeIso, notes/reviewNotes/review metadata, createdAt, updatedAt.
+//    - Read: ADMIN (all), GURU_PIKET (all), WALI_KELAS (own assignedClassId).
+//    - Create/Delete: DENIED from client (Cloud Functions transactions only).
+//    - Update: ADMIN only (manual status correction / audit review) with
+//      immutable identity fields protected.
+//
+// 8. permission_requests/{permissionId}
+//    - Read: ADMIN (all), GURU_PIKET (status in ['DISETUJUI','SUDAH_KELUAR',
+//      'SUDAH_KEMBALI']), WALI_KELAS (own assignedClassId).
+//    - Write: DENIED from client (Cloud Functions only).
+//
+// 9. exit_logs/{exitLogId}
+//    - Read: ADMIN (all), GURU_PIKET (all), WALI_KELAS (own assignedClassId).
+//    - Write: DENIED from client (Cloud Functions only).
+//
+// 10. qr_tokens/{token}
+//     - Read: ADMIN only.
+//     - Write: DENIED from client (Cloud Functions only).
+//
+// 11. devices/{deviceId}
+//     - Read: ADMIN (all) or GURU_PIKET (own device where lastTeacherUid == uid).
+//     - Write: DENIED from client (Cloud Functions only).
+//
+// 12. activity_logs/{logId}
+//     - Immutable audit log.
+//     - Read: ADMIN (all), GURU_PIKET & WALI_KELAS (own logs: userId == uid).
+//     - Write: DENIED from client (Cloud Functions only).
+//
+// 13. offline_tx_dedup/{txUuid}
+//     - Backend idempotency table.
+//     - Read/Write: DENIED from client.
+//
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // Authentication & Role-Based Access Control (RBAC) Helper Functions
+    // =========================================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isActiveUser() {
+      return isAuthenticated()
+        && request.auth.token.active == true
+        && request.auth.token.role in ['ADMIN', 'GURU_PIKET', 'WALI_KELAS'];
+    }
+
+    function isAdmin() {
+      return isActiveUser() && request.auth.token.role == 'ADMIN';
+    }
+
+    function isGuruPiket() {
+      return isActiveUser() && request.auth.token.role == 'GURU_PIKET';
+    }
+
+    function isWaliKelas() {
+      return isActiveUser()
+        && request.auth.token.role == 'WALI_KELAS'
+        && 'assignedClassId' in request.auth.token
+        && request.auth.token.assignedClassId is string
+        && request.auth.token.assignedClassId.size() > 0;
+    }
+
+    function isWaliKelasForClass(classId) {
+      return isWaliKelas() && request.auth.token.assignedClassId == classId;
+    }
+
+    function isOwner(userId) {
+      return isActiveUser() && request.auth.uid == userId;
+    }
+
+    function isAssignedGuruPiket(teacherIds) {
+      return isGuruPiket()
+        && (
+          request.auth.uid in teacherIds
+          || (
+            'teacherId' in request.auth.token
+            && request.auth.token.teacherId is string
+            && request.auth.token.teacherId.size() > 0
+            && request.auth.token.teacherId in teacherIds
+          )
+        );
+    }
+
+    // =========================================================================
+    // Generic Validation & Immutability Helper Functions
+    // =========================================================================
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data)
+        || request.resource.data.uid == null
+        || request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in resource.data)
+        || resource.data.uid == null
+        || resource.data.uid == ''
+        || !('uid' in request.resource.data)
+        || request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function createdAtUnchanged() {
+      return !('createdAt' in resource.data)
+        || resource.data.createdAt == null
+        || (
+          'createdAt' in request.resource.data
+          && request.resource.data.createdAt == resource.data.createdAt
+        );
+    }
+
+    function isNonEmptyString(val, maxLen) {
+      return val is string && val.size() >= 1 && val.size() <= maxLen;
+    }
+
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string
+        && request.resource.data[field].size() >= minLen
+        && request.resource.data[field].size() <= maxLen;
+    }
+
+    function isValidOptionalString(data, field, maxLen) {
+      return !(field in data)
+        || data[field] == null
+        || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isValidUrl(url) {
+      return url is string
+        && url.size() <= 2000
+        && (url.matches('^https://.*') || url.matches('^http://.*'));
+    }
+
+    function isValidOptionalUrl(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] == ''
+        || isValidUrl(data[field]);
+    }
+
+    function isValidEmail(email) {
+      return email is string
+        && email.size() <= 150
+        && email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function isValidOptionalEmail(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] == ''
+        || isValidEmail(data[field]);
+    }
+
+    function isValidDateOnly(dateStr) {
+      return dateStr is string && dateStr.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isValidOptionalDateOnly(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] == ''
+        || isValidDateOnly(data[field]);
+    }
+
+    function isValidTimeHHmm(timeStr) {
+      return timeStr is string && timeStr.matches('^([01]\\d|2[0-3]):[0-5]\\d$');
+    }
+
+    function isValidOptionalTimeHHmm(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] == ''
+        || isValidTimeHHmm(data[field]);
+    }
+
+    function isValidOptionalBool(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] is bool;
+    }
+
+    function isValidOptionalTimestamp(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] is timestamp;
+    }
+
+    function isValidList(listVal, maxSize) {
+      return listVal is list && listVal.size() <= maxSize;
+    }
+
+    function isValidOptionalList(data, field, maxSize) {
+      return !(field in data)
+        || data[field] == null
+        || isValidList(data[field], maxSize);
+    }
+
+    function isValidOptionalIntRange(data, field, minVal, maxVal) {
+      return !(field in data)
+        || data[field] == null
+        || (data[field] is int && data[field] >= minVal && data[field] <= maxVal);
+    }
+
+    // =========================================================================
+    // Domain Validators (Invoked on BOTH create and update)
+    // =========================================================================
+
+    function isValidSchoolProfile(data) {
+      return hasOnlyAllowedFields([
+        'id', 'schoolName', 'name', 'npsn', 'logoUrl', 'address', 'city',
+        'province', 'academicYear', 'academicYearId', 'principal',
+        'principalName', 'principalNip', 'contact', 'phone', 'email',
+        'website', 'tagline', 'motto', 'timezone',
+        'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+      ])
+        && (
+          ('schoolName' in data && isNonEmptyString(data.schoolName, 200))
+          || ('name' in data && isNonEmptyString(data.name, 200))
+        )
+        && isValidOptionalString(data, 'id', 100)
+        && isValidOptionalString(data, 'schoolName', 200)
+        && isValidOptionalString(data, 'name', 200)
+        && isValidOptionalString(data, 'npsn', 30)
+        && isValidOptionalUrl(data, 'logoUrl')
+        && isValidOptionalString(data, 'address', 500)
+        && isValidOptionalString(data, 'city', 100)
+        && isValidOptionalString(data, 'province', 100)
+        && isValidOptionalString(data, 'academicYear', 60)
+        && isValidOptionalString(data, 'academicYearId', 100)
+        && isValidOptionalString(data, 'principal', 150)
+        && isValidOptionalString(data, 'principalName', 150)
+        && isValidOptionalString(data, 'principalNip', 40)
+        && isValidOptionalString(data, 'contact', 150)
+        && isValidOptionalString(data, 'phone', 40)
+        && isValidOptionalEmail(data, 'email')
+        && isValidOptionalUrl(data, 'website')
+        && isValidOptionalString(data, 'tagline', 200)
+        && isValidOptionalString(data, 'motto', 200)
+        && isValidOptionalString(data, 'timezone', 60)
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidMorningWindow(m) {
+      return m is map
+        && m.keys().hasAll(['startTime', 'onTimeDeadline', 'endTime', 'activeDays', 'enabled'])
+        && m.keys().hasOnly(['startTime', 'onTimeDeadline', 'endTime', 'activeDays', 'enabled'])
+        && isValidTimeHHmm(m.startTime)
+        && isValidTimeHHmm(m.onTimeDeadline)
+        && isValidTimeHHmm(m.endTime)
+        && isValidList(m.activeDays, 7)
+        && m.enabled is bool;
+    }
+
+    function isValidAfternoonWindow(a) {
+      return a is map
+        && a.keys().hasAll(['startTime', 'endTime', 'activeDays', 'enabled'])
+        && a.keys().hasOnly(['startTime', 'endTime', 'activeDays', 'enabled'])
+        && isValidTimeHHmm(a.startTime)
+        && isValidTimeHHmm(a.endTime)
+        && isValidList(a.activeDays, 7)
+        && a.enabled is bool;
+    }
+
+    function isValidAttendanceSettings(data) {
+      return hasRequiredFields([
+        'morning', 'afternoon', 'lateToleranceMinutes',
+        'maxClockSkewSeconds', 'offlineAuthDurationMinutes'
+      ])
+        && hasOnlyAllowedFields([
+          'morning', 'afternoon', 'lateToleranceMinutes',
+          'maxClockSkewSeconds', 'offlineAuthDurationMinutes',
+          'exemptedClassIds', 'exemptedStudentIds',
+          'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+        ])
+        && isValidMorningWindow(data.morning)
+        && isValidAfternoonWindow(data.afternoon)
+        && data.lateToleranceMinutes is int
+        && data.lateToleranceMinutes >= 0 && data.lateToleranceMinutes <= 180
+        && data.maxClockSkewSeconds is int
+        && data.maxClockSkewSeconds >= 0 && data.maxClockSkewSeconds <= 86400
+        && data.offlineAuthDurationMinutes is int
+        && data.offlineAuthDurationMinutes >= 15 && data.offlineAuthDurationMinutes <= 1440
+        && isValidOptionalList(data, 'exemptedClassIds', 200)
+        && isValidOptionalList(data, 'exemptedStudentIds', 2000)
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidSystemSetting(docId, data) {
+      return (docId == 'school_profile' && isValidSchoolProfile(data))
+        || (docId == 'attendance' && isValidAttendanceSettings(data));
+    }
+
+    function isValidStudent(data) {
+      return hasRequiredFields(['nis', 'fullName', 'classId', 'active'])
+        && hasOnlyAllowedFields([
+          'id', 'nis', 'nisn', 'fullName', 'gender', 'birthPlaceDate',
+          'address', 'phone', 'parentName', 'parentPhone', 'classId',
+          'className', 'majorId', 'majorName', 'academicYearId',
+          'academicYearName', 'photoUrl', 'active', 'activeQrToken',
+          'classHistory', 'notes', 'qrUpdatedAt',
+          'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+        ])
+        && isNonEmptyString(data.nis, 30)
+        && isNonEmptyString(data.fullName, 120)
+        && isNonEmptyString(data.classId, 100)
+        && data.active is bool
+        && isValidOptionalString(data, 'id', 100)
+        && isValidOptionalString(data, 'nisn', 30)
+        && (!('gender' in data) || data.gender == null || data.gender == '' || data.gender in ['L', 'P'])
+        && isValidOptionalString(data, 'birthPlaceDate', 120)
+        && isValidOptionalString(data, 'address', 500)
+        && isValidOptionalString(data, 'phone', 30)
+        && isValidOptionalString(data, 'parentName', 120)
+        && isValidOptionalString(data, 'parentPhone', 30)
+        && isValidOptionalString(data, 'className', 100)
+        && isValidOptionalString(data, 'majorId', 100)
+        && isValidOptionalString(data, 'majorName', 120)
+        && isValidOptionalString(data, 'academicYearId', 100)
+        && isValidOptionalString(data, 'academicYearName', 60)
+        && isValidOptionalUrl(data, 'photoUrl')
+        && isValidOptionalString(data, 'activeQrToken', 128)
+        && isValidOptionalList(data, 'classHistory', 50)
+        && isValidOptionalString(data, 'notes', 500)
+        && isValidOptionalTimestamp(data, 'qrUpdatedAt')
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidTeacher(data) {
+      return hasOnlyAllowedFields([
+        'id', 'uid', 'nip', 'nuptk', 'fullName', 'name', 'gender', 'email',
+        'phone', 'subject', 'position', 'role', 'assignedClassId',
+        'assignedClassName', 'photoUrl', 'active', 'notes',
+        'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+      ])
+        && (
+          ('fullName' in data && isNonEmptyString(data.fullName, 120))
+          || ('name' in data && isNonEmptyString(data.name, 120))
+        )
+        && isValidOptionalString(data, 'id', 100)
+        && isValidOptionalString(data, 'uid', 128)
+        && isValidOptionalString(data, 'nip', 40)
+        && isValidOptionalString(data, 'nuptk', 40)
+        && isValidOptionalString(data, 'fullName', 120)
+        && isValidOptionalString(data, 'name', 120)
+        && (!('gender' in data) || data.gender == null || data.gender == '' || data.gender in ['L', 'P'])
+        && isValidOptionalEmail(data, 'email')
+        && isValidOptionalString(data, 'phone', 30)
+        && isValidOptionalString(data, 'subject', 120)
+        && isValidOptionalString(data, 'position', 120)
+        && (!('role' in data) || data.role == null || data.role == '' || data.role in ['ADMIN', 'GURU_PIKET', 'WALI_KELAS', 'GURU'])
+        && isValidOptionalString(data, 'assignedClassId', 100)
+        && isValidOptionalString(data, 'assignedClassName', 100)
+        && isValidOptionalUrl(data, 'photoUrl')
+        && isValidOptionalBool(data, 'active')
+        && isValidOptionalString(data, 'notes', 500)
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidClass(data) {
+      return hasRequiredFields(['name'])
+        && hasOnlyAllowedFields([
+          'id', 'name', 'code', 'grade', 'level', 'majorId', 'majorName',
+          'academicYearId', 'academicYearName', 'homeroomTeacherId',
+          'homeroomTeacherUid', 'homeroomTeacherName', 'capacity', 'active',
+          'notes', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+        ])
+        && isNonEmptyString(data.name, 100)
+        && isValidOptionalString(data, 'id', 100)
+        && isValidOptionalString(data, 'code', 40)
+        && (!('grade' in data) || data.grade == null || (data.grade is string && data.grade.size() <= 20) || (data.grade is int && data.grade >= 1 && data.grade <= 15))
+        && (!('level' in data) || data.level == null || (data.level is string && data.level.size() <= 20) || (data.level is int && data.level >= 1 && data.level <= 15))
+        && isValidOptionalString(data, 'majorId', 100)
+        && isValidOptionalString(data, 'majorName', 120)
+        && isValidOptionalString(data, 'academicYearId', 100)
+        && isValidOptionalString(data, 'academicYearName', 60)
+        && isValidOptionalString(data, 'homeroomTeacherId', 128)
+        && isValidOptionalString(data, 'homeroomTeacherUid', 128)
+        && isValidOptionalString(data, 'homeroomTeacherName', 120)
+        && isValidOptionalIntRange(data, 'capacity', 0, 200)
+        && isValidOptionalBool(data, 'active')
+        && isValidOptionalString(data, 'notes', 500)
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidMajor(data) {
+      return hasRequiredFields(['name'])
+        && hasOnlyAllowedFields([
+          'id', 'code', 'name', 'description', 'headTeacherId',
+          'headTeacherName', 'active',
+          'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+        ])
+        && isNonEmptyString(data.name, 120)
+        && isValidOptionalString(data, 'id', 100)
+        && isValidOptionalString(data, 'code', 30)
+        && isValidOptionalString(data, 'description', 500)
+        && isValidOptionalString(data, 'headTeacherId', 128)
+        && isValidOptionalString(data, 'headTeacherName', 120)
+        && isValidOptionalBool(data, 'active')
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidAcademicYear(data) {
+      return hasRequiredFields(['name'])
+        && hasOnlyAllowedFields([
+          'id', 'name', 'semester', 'startDate', 'endDate', 'active',
+          'isCurrent', 'notes',
+          'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+        ])
+        && isNonEmptyString(data.name, 60)
+        && isValidOptionalString(data, 'id', 100)
+        && (!('semester' in data) || data.semester == null || (data.semester is string && data.semester.size() <= 30) || (data.semester is int && data.semester >= 1 && data.semester <= 2))
+        && isValidOptionalDateOnly(data, 'startDate')
+        && isValidOptionalDateOnly(data, 'endDate')
+        && isValidOptionalBool(data, 'active')
+        && isValidOptionalBool(data, 'isCurrent')
+        && isValidOptionalString(data, 'notes', 500)
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidHoliday(data) {
+      return hasRequiredFields(['date', 'name', 'type', 'disableAttendance'])
+        && hasOnlyAllowedFields([
+          'id', 'date', 'name', 'type', 'disableAttendance',
+          'customMorningStart', 'customMorningDeadline', 'customMorningEnd',
+          'customAfternoonStart', 'customAfternoonEnd', 'exemptedClassIds',
+          'notes', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+        ])
+        && isValidDateOnly(data.date)
+        && isNonEmptyString(data.name, 150)
+        && data.type in ['LIBUR', 'HARI_KHUSUS', 'KEGIATAN_SEKOLAH', 'PENGECUALIAN']
+        && data.disableAttendance is bool
+        && isValidOptionalString(data, 'id', 100)
+        && isValidOptionalTimeHHmm(data, 'customMorningStart')
+        && isValidOptionalTimeHHmm(data, 'customMorningDeadline')
+        && isValidOptionalTimeHHmm(data, 'customMorningEnd')
+        && isValidOptionalTimeHHmm(data, 'customAfternoonStart')
+        && isValidOptionalTimeHHmm(data, 'customAfternoonEnd')
+        && isValidOptionalList(data, 'exemptedClassIds', 200)
+        && isValidOptionalString(data, 'notes', 500)
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidDutySchedule(data) {
+      return hasRequiredFields(['title', 'type', 'teacherIds', 'startTime', 'endTime', 'active'])
+        && hasOnlyAllowedFields([
+          'id', 'title', 'type', 'date', 'daysOfWeek', 'teacherIds',
+          'teacherNames', 'startTime', 'endTime', 'active', 'notes',
+          'createdAt', 'updatedAt', 'createdBy', 'updatedBy'
+        ])
+        && isNonEmptyString(data.title, 150)
+        && data.type in ['HARIAN', 'MINGGUAN', 'TANGGAL']
+        && isValidList(data.teacherIds, 50)
+        && data.teacherIds.size() >= 1
+        && isValidTimeHHmm(data.startTime)
+        && isValidTimeHHmm(data.endTime)
+        && data.active is bool
+        && (
+          (data.type == 'MINGGUAN' && 'daysOfWeek' in data && isValidList(data.daysOfWeek, 7) && data.daysOfWeek.size() >= 1)
+          || (data.type in ['HARIAN', 'TANGGAL'] && 'date' in data && isValidDateOnly(data.date))
+        )
+        && isValidOptionalString(data, 'id', 100)
+        && isValidOptionalDateOnly(data, 'date')
+        && isValidOptionalList(data, 'daysOfWeek', 7)
+        && (!('teacherNames' in data) || data.teacherNames == null || (data.teacherNames is map && data.teacherNames.size() <= 50))
+        && isValidOptionalString(data, 'notes', 500)
+        && isValidOptionalTimestamp(data, 'createdAt')
+        && isValidOptionalTimestamp(data, 'updatedAt')
+        && isValidOptionalString(data, 'createdBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128);
+    }
+
+    function isValidAttendanceUpdate(data) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'morningStatus', 'afternoonStatus', 'morningLateMinutes',
+          'flaggedForReview', 'missingMorningWarning',
+          'notes', 'manualNote', 'reviewNote', 'reviewNotes',
+          'reviewedBy', 'reviewedByName', 'reviewedAt',
+          'manualOverride', 'correctedBy', 'correctedAt',
+          'updatedAt', 'updatedBy', 'updatedByName'
+        ])
+        && hasRequiredFields(['date', 'studentId', 'classId', 'morningStatus', 'afternoonStatus'])
+        && areImmutableFieldsUnchanged([
+          'id', 'date', 'studentId', 'classId', 'createdAt',
+          'morningTime', 'morningTeacherUid', 'morningDeviceId', 'morningTransactionUuid',
+          'afternoonTime', 'afternoonTeacherUid', 'afternoonDeviceId', 'afternoonTransactionUuid',
+          'sourceMode', 'clockSkewSeconds', 'deviceLocalTimeIso'
+        ])
+        && isValidDateOnly(data.date)
+        && isNonEmptyString(data.studentId, 100)
+        && isNonEmptyString(data.classId, 100)
+        && data.morningStatus in ['HADIR', 'TERLAMBAT', 'IZIN', 'SAKIT', 'ALPA', 'BELUM_ABSEN']
+        && data.afternoonStatus in ['PULANG', 'BELUM_ABSEN']
+        && isValidOptionalBool(data, 'flaggedForReview')
+        && isValidOptionalBool(data, 'missingMorningWarning')
+        && isValidOptionalBool(data, 'manualOverride')
+        && isValidOptionalIntRange(data, 'morningLateMinutes', 0, 1440)
+        && isValidOptionalString(data, 'notes', 500)
+        && isValidOptionalString(data, 'manualNote', 500)
+        && isValidOptionalString(data, 'reviewNote', 500)
+        && isValidOptionalString(data, 'reviewNotes', 500)
+        && isValidOptionalString(data, 'reviewedBy', 128)
+        && isValidOptionalString(data, 'reviewedByName', 120)
+        && isValidOptionalString(data, 'correctedBy', 128)
+        && isValidOptionalString(data, 'updatedBy', 128)
+        && isValidOptionalString(data, 'updatedByName', 120)
+        && isValidOptionalTimestamp(data, 'reviewedAt')
+        && isValidOptionalTimestamp(data, 'correctedAt')
+        && isValidOptionalTimestamp(data, 'updatedAt');
+    }
+
+    // =========================================================================
+    // Collection Rules
+    // =========================================================================
+
+    // 1. System Settings
+    //    - school_profile: public GET allowed strictly for non-sensitive login branding.
+    //    - All other docs (e.g., attendance) and collection LIST require active auth.
+    //    - Writes: ADMIN only with strict schema validation.
+    match /system_settings/{docId} {
+      allow get: if docId == 'school_profile' || isActiveUser();
+      allow list: if isActiveUser();
+      allow create: if isAdmin() && isValidSystemSetting(docId, request.resource.data);
+      allow update: if isAdmin()
+        && isValidSystemSetting(docId, request.resource.data)
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 2. Users (PII + Role Profiles)
+    //    - Read: ADMIN (all) or self (active user matching uid).
+    //    - Write: DENIED from client (managed strictly via Admin SDK Cloud Functions).
+    match /users/{uid} {
+      allow read: if isAdmin() || isOwner(uid);
+      allow create, update, delete: if false;
+    }
+
+    // 3. Students (Contains student & parent PII — NO public access)
+    //    - Read: ADMIN (all), GURU_PIKET (all), WALI_KELAS (assignedClassId only).
+    //    - Write/Delete: ADMIN only with validation.
+    match /students/{studentId} {
+      allow read: if isAdmin()
+        || isGuruPiket()
+        || isWaliKelasForClass(resource.data.classId);
+      allow create: if isAdmin() && isValidStudent(request.resource.data);
+      allow update: if isAdmin()
+        && isValidStudent(request.resource.data)
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 4. Teachers
+    //    - Read: Any active authenticated user.
+    //    - Write/Delete: ADMIN only with validation.
+    match /teachers/{teacherId} {
+      allow read: if isActiveUser();
+      allow create: if isAdmin() && isValidTeacher(request.resource.data);
+      allow update: if isAdmin()
+        && isValidTeacher(request.resource.data)
+        && uidNotModified()
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 5a. Classes
+    match /classes/{classId} {
+      allow read: if isActiveUser();
+      allow create: if isAdmin() && isValidClass(request.resource.data);
+      allow update: if isAdmin()
+        && isValidClass(request.resource.data)
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 5b. Majors
+    match /majors/{majorId} {
+      allow read: if isActiveUser();
+      allow create: if isAdmin() && isValidMajor(request.resource.data);
+      allow update: if isAdmin()
+        && isValidMajor(request.resource.data)
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 5c. Academic Years
+    match /academic_years/{yearId} {
+      allow read: if isActiveUser();
+      allow create: if isAdmin() && isValidAcademicYear(request.resource.data);
+      allow update: if isAdmin()
+        && isValidAcademicYear(request.resource.data)
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 5d. Holidays & Special Days
+    match /holidays/{holidayId} {
+      allow read: if isActiveUser();
+      allow create: if isAdmin() && isValidHoliday(request.resource.data);
+      allow update: if isAdmin()
+        && isValidHoliday(request.resource.data)
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 6. Duty Schedules
+    //    - Read: ADMIN (all), GURU_PIKET (assigned schedules only), WALI_KELAS (DENIED).
+    //    - Write/Delete: ADMIN only (Guru Piket MUST NOT modify schedules).
+    match /duty_schedules/{scheduleId} {
+      allow read: if isAdmin() || isAssignedGuruPiket(resource.data.teacherIds);
+      allow create: if isAdmin() && isValidDutySchedule(request.resource.data);
+      allow update: if isAdmin()
+        && isValidDutySchedule(request.resource.data)
+        && createdAtUnchanged();
+      allow delete: if isAdmin();
+    }
+
+    // 7. Attendance (Doc ID: YYYY-MM-DD_{studentId})
+    //    - Read: ADMIN (all), GURU_PIKET (all), WALI_KELAS (assignedClassId only).
+    //    - Create/Delete: DENIED from client (Cloud Functions transactions only).
+    //    - Update: ADMIN only (manual correction / review clearance) with immutable
+    //      identity fields protected.
+    match /attendance/{attendanceId} {
+      allow read: if isAdmin()
+        || isGuruPiket()
+        || isWaliKelasForClass(resource.data.classId);
+      allow create, delete: if false;
+      allow update: if isAdmin() && isValidAttendanceUpdate(request.resource.data);
+    }
+
+    // 8. Permission Requests
+    //    - Read: ADMIN (all), GURU_PIKET (approved/exit/return statuses only),
+    //      WALI_KELAS (assignedClassId only).
+    //    - Write: DENIED from client (all transitions enforced in Cloud Functions).
+    match /permission_requests/{permissionId} {
+      allow read: if isAdmin()
+        || (
+          isGuruPiket()
+          && resource.data.status in ['DISETUJUI', 'SUDAH_KELUAR', 'SUDAH_KEMBALI']
+        )
+        || isWaliKelasForClass(resource.data.classId);
+      allow create, update, delete: if false;
+    }
+
+    // 9. Exit Logs
+    //    - Read: ADMIN (all), GURU_PIKET (all), WALI_KELAS (assignedClassId only).
+    //    - Write: DENIED from client (Cloud Functions Admin SDK only).
+    match /exit_logs/{exitLogId} {
+      allow read: if isAdmin()
+        || isGuruPiket()
+        || isWaliKelasForClass(resource.data.classId);
+      allow create, update, delete: if false;
+    }
+
+    // 10. QR Tokens Registry
+    //     - Read: ADMIN only (never expose raw token registry to other roles/public).
+    //     - Write: DENIED from client (Cloud Functions Admin SDK only).
+    match /qr_tokens/{token} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // 11. Registered Scanner Devices
+    //     - Read: ADMIN (all) or GURU_PIKET reading own device.
+    //     - Write: DENIED from client (Cloud Functions Admin SDK only).
+    match /devices/{deviceId} {
+      allow read: if isAdmin()
+        || (isGuruPiket() && resource.data.lastTeacherUid == request.auth.uid);
+      allow create, update, delete: if false;
+    }
+
+    // 12. Activity Logs (Immutable Audit Trail)
+    //     - Read: ADMIN (all), GURU_PIKET & WALI_KELAS (own logs only).
+    //     - Write: DENIED from client (immutable; Cloud Functions Admin SDK only).
+    match /activity_logs/{logId} {
+      allow read: if isAdmin()
+        || (
+          (isGuruPiket() || isWaliKelas())
+          && resource.data.userId == request.auth.uid
+        );
+      allow create, update, delete: if false;
+    }
+
+    // 13. Offline Transaction Idempotency / Deduplication Table
+    //     - Completely inaccessible from client (backend Admin SDK only).
+    match /offline_tx_dedup/{txUuid} {
+      allow read, write: if false;
+    }
+
+    // 14. Default Catch-All: Deny all other reads and writes
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

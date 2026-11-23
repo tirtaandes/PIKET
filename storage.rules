@@ -1,0 +1,49 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.disabled != true;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.role == 'ADMIN';
+    }
+
+    function isGuruPiket() {
+      return isSignedIn() && request.auth.token.role == 'GURU_PIKET';
+    }
+
+    function isWaliKelas() {
+      return isSignedIn() && request.auth.token.role == 'WALI_KELAS';
+    }
+
+    function isValidImage() {
+      return request.resource != null
+        && request.resource.size <= 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp)');
+    }
+
+    // Logo sekolah dapat dibaca oleh halaman login (public branding non-sensitif), hanya admin yang boleh menulis
+    match /school/{fileName} {
+      allow read: if true;
+      allow write: if isAdmin() && isValidImage();
+      allow delete: if isAdmin();
+    }
+
+    // Foto siswa: HANYA user login dengan role sah (TIDAK ADA akses publik!)
+    // Format path: students/{classId}/{studentId}/{fileName}
+    match /students/{classId}/{studentId}/{fileName} {
+      allow read: if isAdmin()
+        || isGuruPiket()
+        || (isWaliKelas() && request.auth.token.assignedClassId == classId);
+      allow write: if isAdmin() && isValidImage();
+      allow delete: if isAdmin();
+    }
+
+    // Default deny seluruh path lainnya
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

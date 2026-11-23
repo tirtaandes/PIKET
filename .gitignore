@@ -1,0 +1,15 @@
+node_modules/
+dist/
+functions/node_modules/
+functions/lib/
+.env
+.env.local
+.env.*.local
+.firebaserc
+*.log
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+serviceAccountKey.json
+*.pem
+.DS_Store
